@@ -37,7 +37,7 @@ def start_tcp_flood():
     net = Mininet(topo=MyTopo(),
                   link=TCLink,
                   controller=RemoteController('c0',
-                                              ip='192.168.1.62',
+                                              ip='192.168.1.153',
                                               port=6653))
     net.start()
     hosts = [ net.get('h%d' % i) for i in range(1,19) ]

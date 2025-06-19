@@ -102,7 +102,7 @@ if __name__ == '__main__':
     net = Mininet(topo=topo,
                   link=TCLink,
                   controller=RemoteController('c0',
-                                              ip='192.168.1.62',
+                                              ip='192.168.1.153',
                                               port=6653))
     net.start()
 

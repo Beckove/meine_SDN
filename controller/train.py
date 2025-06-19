@@ -1,42 +1,50 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Python3 script to train Random Forest and StandardScaler on dm.csv,
+Python3 script to train Random Forest and StandardScaler on combined.csv,
 then save the models as joblib files for use in the controller.
+Also prints accuracy on a 10% test split.
 """
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 import joblib
 
-# 1. Read data from dm.csv (no header)
-#    dm.csv should be in current working directory
-#    Columns: 0..N-1, where column 7 is IP (drop), last column is label
+# Đọc dữ liệu
+df = pd.read_csv('combined.csv', header=None)
 
-df = pd.read_csv('vl.csv', header=None)
-
-# 2. Drop the IP address column (index 7)
+# Xóa cột thứ 8 (index = 7)
 df = df.drop(df.columns[7], axis=1)
 
-# 3. Separate features and labels
+# Tách features và labels
 X = df.iloc[:, :-1].values  # all columns except last
 y = df.iloc[:, -1].values   # last column as label
 
-# 4. Scale features
+# Chia train/test với 10% test
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.10, random_state=42)
+
+# Chuẩn hóa dữ liệu
 scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
 
-# 5. Train Random Forest classifier
+# Huấn luyện mô hình Random Forest
 clf = RandomForestClassifier(n_estimators=100, criterion='entropy', random_state=0)
-clf.fit(X_scaled, y)
+clf.fit(X_train_scaled, y_train)
 
-# 6. Save the trained model and scaler
+# Dự đoán và đánh giá accuracy
+y_pred = clf.predict(X_test_scaled)
+accuracy = accuracy_score(y_test, y_pred)
+
+# Lưu model và scaler
 tjob_path = 'rf_model_1.joblib'
 scaler_path = 'rf_scaler_1.joblib'
 joblib.dump(clf, tjob_path)
 joblib.dump(scaler, scaler_path)
 
-print(f"Training completed.")
+# In kết quả
+print("Training completed.")
+print(f"Accuracy on 10% test split: {accuracy * 100:.2f}%")
 print(f"Model saved to: {tjob_path}")
 print(f"Scaler saved to: {scaler_path}")
 

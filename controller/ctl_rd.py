@@ -1,8 +1,4 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-Traffic monitor & mitigation with RandomForest labels and Ryu controller
-"""
 from __future__ import print_function
 from ryu.controller import ofp_event
 from ryu.controller.handler import MAIN_DISPATCHER, DEAD_DISPATCHER, CONFIG_DISPATCHER
@@ -23,60 +19,63 @@ class SimpleMonitorLabel(switch.SimpleSwitch13):
 
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
-    # METER ID cho hạn chế lưu lượng (giữ nguyên nếu cần)
-    METER_RATE_LIMIT_ID = 1
-    METER_BURST_SIZE = 5  # packets
-    RATE_KBPS = 30        # giới hạn byte rate kbps
-
     def __init__(self, *args, **kwargs):
         super(SimpleMonitorLabel, self).__init__(*args, **kwargs)
         self.datapaths = {}
         self.monitor_thread = hub.spawn(self._monitor)
 
-        # Counter smurf đã ghi
-        self.smurf_count = 0
-
-        # Load model và scaler
-        self.rf = joblib.load('rf_model.joblib')
-        self.scaler = joblib.load('rf_scaler.joblib')
-
-        # Khởi tạo file CSV
-        self.out_file = 'lz.csv'
+        self.out_file = 'prd.csv'
         if not os.path.exists(self.out_file):
             with open(self.out_file, 'w') as f:
                 f.write('pkt_rate,pkt_delay,byte_rate,last_pkt,'
                         'fid,num_pkt,first_pkt,des_add,'
-                        'pkt_in,duration_1,byte_count,duration_2,'
+                        'pkt_in,duration_1,num_byte,duration_2,'
                         'pkt_out,pkt_sz,is_broadcast,label\n')
+
+
+        self.rf = joblib.load('rf_model.joblib')
+        self.scaler = joblib.load('rf_scaler.joblib')
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         dp = ev.msg.datapath
-        parser = dp.ofproto_parser
         ofp = dp.ofproto
+        parser = dp.ofproto_parser
 
-        # Cài meter để rate-limit: drop vượt ngưỡng
-        bands = [parser.OFPMeterBandDrop(rate=self.RATE_KBPS, burst_size=self.METER_BURST_SIZE)]
-        dp.send_msg(parser.OFPMeterMod(
-            datapath=dp, command=ofp.OFPMC_ADD,
-            flags=ofp.OFPMF_KBPS, meter_id=self.METER_RATE_LIMIT_ID,
-            bands=bands))
 
-        # Table-miss: gửi tất cả traffic lạ lên controller
+        match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
-        inst_all = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
         dp.send_msg(parser.OFPFlowMod(
-            datapath=dp, priority=0,
-            match=parser.OFPMatch(), instructions=inst_all))
+            datapath=dp, priority=0, match=match, instructions=inst))
 
-        # Smurf detection: gửi ICMP directed-broadcast lên controller
+
+        smurf_match = parser.OFPMatch(
+            eth_type=0x0800,
+            ip_proto=1,
+            ipv4_dst='10.0.0.255'
+        )
+        flood_actions = [
+            parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER),
+            parser.OFPActionOutput(ofp.OFPP_FLOOD, 0)
+        ]
+        inst2 = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, flood_actions)]
         dp.send_msg(parser.OFPFlowMod(
-            datapath=dp, priority=100,
-            match=parser.OFPMatch(eth_type=0x0800, ip_proto=1, ipv4_dst='10.0.0.255'),
-            instructions=inst_all))
+            datapath=dp, priority=100, match=smurf_match, instructions=inst2
+        ))
 
-        # Reactive forwarding cho traffic khác
+
         super(SimpleMonitorLabel, self).switch_features_handler(ev)
+
+    def _monitor(self):
+        while True:
+            for dp in self.datapaths.values():
+                self._request_stats(dp)
+            hub.sleep(10)
+
+    def _request_stats(self, dp):
+        parser = dp.ofproto_parser
+        dp.send_msg(parser.OFPFlowStatsRequest(dp))
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
@@ -86,93 +85,51 @@ class SimpleMonitorLabel(switch.SimpleSwitch13):
         elif ev.state == DEAD_DISPATCHER:
             self.datapaths.pop(dp.id, None)
 
-    def _monitor(self):
-        while True:
-            for dp in list(self.datapaths.values()):
-                self._request_stats(dp)
-            hub.sleep(10)
-
-    def _request_stats(self, dp):
-        dp.send_msg(dp.ofproto_parser.OFPFlowStatsRequest(dp))
-
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
-        dp = ev.msg.datapath
-        parser = dp.ofproto_parser
-        ofp = dp.ofproto
         now_ts = datetime.now().timestamp()
-
         with open(self.out_file, 'a') as f:
             for stat in ev.msg.body:
-                # Lọc giao thức
                 proto = stat.match.get('ip_proto')
-                if proto not in (1, 6, 17): continue
-
-                # Bỏ flow đã chặn smurf sau 10 lần
-                if stat.match.get('ipv4_dst') == '10.0.0.255' and self.smurf_count >= 10:
+                if proto not in (1, 6, 17):
                     continue
 
                 pkt_cnt = stat.packet_count
                 byte_cnt = stat.byte_count
-                if pkt_cnt == 0: continue
+                if pkt_cnt == 0:
+                    continue
 
-                # Tính feature
                 dur = stat.duration_sec + stat.duration_nsec * 1e-9
-                pkt_rate = pkt_cnt / dur if dur else 0
-                pkt_delay = dur / pkt_cnt if pkt_cnt else 0
+                pkt_rate = (pkt_cnt / dur)*1 if dur else 0
+                pkt_delay = (dur / pkt_cnt)*1 if pkt_cnt else 0
                 byte_rate = byte_cnt / dur if dur else 0
                 last_pkt = now_ts
                 first_pkt = now_ts - dur
-                pkt_sz = byte_cnt / pkt_cnt
-                is_b = 1 if stat.match.get('ipv4_dst','').endswith('.255') else 0
 
-                src = stat.match.get('ipv4_src','0.0.0.0')
-                dst = stat.match.get('ipv4_dst','0.0.0.0')
+                src_ip = stat.match.get('ipv4_src', '0.0.0.0')
+                dst_ip = stat.match.get('ipv4_dst', '0.0.0.0')
                 sport = stat.match.get('tcp_src', stat.match.get('udp_src', 0))
                 dport = stat.match.get('tcp_dst', stat.match.get('udp_dst', 0))
-                fid = hash((src, sport, dst, dport, proto))
+                fid = hash((src_ip, sport, dst_ip, dport, proto))
+                pkt_sz = byte_cnt / pkt_cnt if pkt_cnt else 0
+                is_b = 1 if dst_ip.endswith('.255') else 0
 
-                # Dự đoán nhãn
+
+                feat = [pkt_rate, pkt_delay, byte_rate, last_pkt,
+                        fid, pkt_cnt, first_pkt, dst_ip,
+                        pkt_cnt, dur, byte_cnt, dur,
+                        pkt_cnt, pkt_sz, is_b]
                 X = np.array([[pkt_rate, pkt_delay, byte_rate,
                                last_pkt, fid, pkt_cnt, first_pkt,
-                               pkt_cnt, dur, byte_cnt,
-                               dur, pkt_cnt, pkt_sz, is_b]])
+                               int(ipaddress.IPv4Address(dst_ip)), pkt_cnt,
+                               dur, byte_cnt, dur, pkt_cnt, pkt_sz, is_b]])
                 try:
                     Xs = self.scaler.transform(X)
                     pred = self.rf.predict(Xs)[0]
-                    label = {0:'benign',1:'smurf',2:'icmp_fl',3:'tcp_fl',4:'udp_fl'}.get(pred,'mein_benign')
+                    label_map = {0:'benign',1:'smurf',2:'icmp_fl',3:'udp_fl',4:'tcp_fl'}
+                    label = label_map.get(pred, 'unknown')
                 except Exception:
-                    label = 'mein_benign'
+                    label = 'unknown'
 
-                # Ghi CSV
-                f.write(','.join(map(str,[pkt_rate,pkt_delay,byte_rate,last_pkt,
-                                           fid,pkt_cnt,first_pkt,dst,
-                                           pkt_cnt,dur,byte_cnt,dur,
-                                           pkt_cnt,pkt_sz,is_b, label])) + '\n')
-
-                # Smurf mitigation
-                if label == 'smurf':
-                    print("Smurf mitigation starts")
-                    self.smurf_count += 1
-                    if self.smurf_count == 10:
-                        # Cài rule drop broadcast tại tất cả switch
-                        for dp2 in self.datapaths.values():
-                            dp2.send_msg(parser.OFPFlowMod(
-                                datapath=dp2,
-                                priority=300,
-                                match=parser.OFPMatch(eth_type=0x0800, ip_proto=1, ipv4_dst='10.0.0.255'),
-                                instructions=[]))
-
-                # Mitigation individual flow nếu cần (drop/rate-limit)
-                if label not in ('benign','mein_benign','smurf'):
-                    print("Flood mitigation starts")
-                    match = parser.OFPMatch(eth_type=0x0800, ip_proto=proto,
-                                            ipv4_src=src, ipv4_dst=dst,
-                                            **({'tcp_src':sport,'tcp_dst':dport} if proto==6 else {}),
-                                            **({'udp_src':sport,'udp_dst':dport} if proto==17 else {}))
-                    dp.send_msg(parser.OFPFlowMod(
-                        datapath=dp,
-                        priority=200,
-                        match=match,
-                        instructions=[parser.OFPInstructionMeter(self.METER_RATE_LIMIT_ID)]))
+                f.write(','.join(map(str, feat + [label])) + '\n')
 
