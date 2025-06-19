@@ -6,13 +6,10 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
 from ryu.lib.packet import ethernet, ipv4, tcp, udp, icmp
 
-import numpy as np
-import ipaddress
-import joblib
 import os
 from datetime import datetime
 
-import switch
+import switch  # kế thừa từ SimpleSwitch13
 
 class SimpleMonitorLabel(switch.SimpleSwitch13):
 
@@ -22,11 +19,6 @@ class SimpleMonitorLabel(switch.SimpleSwitch13):
         super(SimpleMonitorLabel, self).__init__(*args, **kwargs)
         self.datapaths = {}
         self.monitor_thread = hub.spawn(self._monitor)
-
-        self.smurf_count = 0
-
-        self.rf = joblib.load('rf_model.joblib')
-        self.scaler = joblib.load('rf_scaler.joblib')
 
         self.out_file = 'dt_col.csv'
         if not os.path.exists(self.out_file):
@@ -42,16 +34,11 @@ class SimpleMonitorLabel(switch.SimpleSwitch13):
         parser = dp.ofproto_parser
         ofp = dp.ofproto
 
+        # Mọi gói đến controller
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
         inst_all = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
-        dp.send_msg(parser.OFPFlowMod(
-            datapath=dp, priority=0,
-            match=parser.OFPMatch(), instructions=inst_all))
-
-        dp.send_msg(parser.OFPFlowMod(
-            datapath=dp, priority=100,
-            match=parser.OFPMatch(eth_type=0x0800, ip_proto=1, ipv4_dst='10.0.0.255'),
-            instructions=inst_all))
+        dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=0,
+                                      match=parser.OFPMatch(), instructions=inst_all))
 
         super(SimpleMonitorLabel, self).switch_features_handler(ev)
 
@@ -74,21 +61,17 @@ class SimpleMonitorLabel(switch.SimpleSwitch13):
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
-        dp = ev.msg.datapath
-        parser = dp.ofproto_parser
         now_ts = datetime.now().timestamp()
-
         with open(self.out_file, 'a') as f:
             for stat in ev.msg.body:
                 proto = stat.match.get('ip_proto')
-                if proto not in (1, 6, 17): continue
-
-                if stat.match.get('ipv4_dst') == '10.0.0.255' and self.smurf_count >= 10:
+                if proto not in (1, 6, 17):
                     continue
 
                 pkt_cnt = stat.packet_count
                 byte_cnt = stat.byte_count
-                if pkt_cnt == 0: continue
+                if pkt_cnt == 0:
+                    continue
 
                 dur = stat.duration_sec + stat.duration_nsec * 1e-9
                 pkt_rate = pkt_cnt / dur if dur else 0
@@ -103,23 +86,12 @@ class SimpleMonitorLabel(switch.SimpleSwitch13):
                 dst = stat.match.get('ipv4_dst','0.0.0.0')
                 sport = stat.match.get('tcp_src', stat.match.get('udp_src', 0))
                 dport = stat.match.get('tcp_dst', stat.match.get('udp_dst', 0))
+                # Đơn giản hóa: dùng tuple làm flow ID
                 fid = hash((src, sport, dst, dport, proto))
 
-                X = np.array([[pkt_rate, pkt_delay, byte_rate,
-                               last_pkt, fid, pkt_cnt, first_pkt,
-                               pkt_cnt, dur, byte_cnt,
-                               dur, pkt_cnt, pkt_sz, is_b]])
-                try:
-                    Xs = self.scaler.transform(X)
-                    pred = self.rf.predict(Xs)[0]
-                    label = {0:'benign',1:'smurf',2:'icmp_fl',3:'tcp_fl',4:'udp_fl'}.get(pred,'unknown')
-                except:
-                    label = 'unknown'
-
-                f.write(','.join(map(str,[pkt_rate,pkt_delay,byte_rate,last_pkt,
-                                           fid,pkt_cnt,first_pkt,dst,
-                                           pkt_cnt,dur,byte_cnt,dur,
-                                           pkt_cnt,pkt_sz,is_b, label])) + '\n')
-
-
-
+                # Ghi ra CSV, label cố định bằng 1
+                row = [pkt_rate, pkt_delay, byte_rate, last_pkt,
+                       fid, pkt_cnt, first_pkt, dst,
+                       pkt_cnt, dur, byte_cnt, dur,
+                       pkt_cnt, pkt_sz, is_b, 1]
+                f.write(','.join(map(str, row)) + '\n')
